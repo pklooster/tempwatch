@@ -1,0 +1,4 @@
+# /etc/cron.d/tempwatch — check every 5 minutes, ping Telegram on state change.
+# Check mode is silent unless something actually changes state.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root /usr/local/bin/tempwatch -c >/dev/null 2>&1

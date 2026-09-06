@@ -1,0 +1,384 @@
+#!/bin/bash
+# tempwatch — temperature monitor for Linux servers.
+#   tempwatch              one-shot readout
+#   tempwatch -w [secs]    live view (default 5s refresh)
+#   tempwatch -c           cron/check mode: silent unless state changes -> Telegram
+#   tempwatch -j           JSON output
+#   tempwatch -t           send a test Telegram message
+#   tempwatch -V           print version
+# Sensors come from hwmon sysfs (CPU/board/NIC/NVMe) + smartctl (SATA disks).
+# Sleeping disks are never woken (smartctl -n standby).
+# Config lives in ~/.config/tempwatch/ — see thresholds.conf and fans.conf.
+set -uo pipefail
+
+TEMPWATCH_VERSION=1.0.0
+
+: "${HOME:=/root}"
+CFG="${TEMPWATCH_CFG:-${XDG_CONFIG_HOME:-$HOME/.config}/tempwatch}"
+STATE="$CFG/state.txt"
+LOG="$CFG/temp.log"
+FANSEEN="$CFG/fans-seen.txt"
+CONF="$CFG/thresholds.conf"
+FANCONF="$CFG/fans.conf"
+# thresholds.conf may override ENV_FILE to share credentials with another tool.
+ENV_FILE="${TEMPWATCH_ENV:-$CFG/telegram.env}"
+mkdir -p "$CFG" 2>/dev/null || true
+
+# ---- defaults (override in $CONF) -------------------------------------------
+CPU_WARN=80;   CPU_CRIT=90       # AMD Tctl/Tccd
+BOARD_WARN=75; BOARD_CRIT=90     # motherboard / chipset / VRM
+NIC_WARN=95;   NIC_CRIT=110      # onboard NIC (spec max 120)
+HDD_WARN=45;   HDD_CRIT=55       # spinning rust (spec max usually 60)
+NVME_WARN=70;  NVME_CRIT=85      # fallback; drive-reported limits win
+SHOW_ACPITZ=0                    # many boards report a fixed bogus value here
+CRIT_REPEAT=1800                 # re-nag interval (s) while still critical
+DISK_EVERY=30                    # watch mode: re-poll disks every N seconds
+LOG_KEEP=5000
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+# shellcheck source=/dev/null
+[ -f "$ENV_FILE" ] && . "$ENV_FILE"
+TOKEN="${TELEGRAM_BOT_TOKEN:-}"; CHAT="${TELEGRAM_CHAT_ID:-}"
+
+MODE=show; INTERVAL=5
+case "${1:-}" in
+  -w|--watch) MODE=watch; [ -n "${2:-}" ] && INTERVAL="$2" ;;
+  -c|--check) MODE=check ;;
+  -j|--json)  MODE=json ;;
+  -t|--test)  MODE='test' ;;
+  -V|--version) echo "tempwatch $TEMPWATCH_VERSION"; exit 0 ;;
+  -h|--help)  sed -n '2,11p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  "")         ;;
+  *)          echo "unknown option: $1 (try -h)" >&2; exit 64 ;;
+esac
+
+# ---- collection -------------------------------------------------------------
+# Emits: key|group|label|temp|warn|crit
+DISK_CACHE=""; DISK_CACHE_AT=0
+
+read_hwmon() {
+  local h name label val warn crit key group ctrl blk model f n have_it87=0
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -r "$h/name" ] && case "$(<"$h/name")" in it87*|it86*) have_it87=1 ;; esac
+  done
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -r "$h/name" ] || continue
+    name=$(<"$h/name")
+    # On Gigabyte boards gigabyte_wmi duplicates the IT86xx/IT87xx sensors over
+    # WMI — prefer the real driver when it is loaded.
+    [ "$name" = gigabyte_wmi ] && [ "$have_it87" = 1 ] && continue
+    case "$name" in
+      k10temp)      group=cpu;   warn=$CPU_WARN;   crit=$CPU_CRIT ;;
+      gigabyte_wmi|it87*|nct*|coretemp) group=board; warn=$BOARD_WARN; crit=$BOARD_CRIT ;;
+      r8169*|igb*|ixgbe*|e1000*) group=nic; warn=$NIC_WARN; crit=$NIC_CRIT ;;
+      nvme)         group=nvme;  warn=$NVME_WARN;  crit=$NVME_CRIT ;;
+      acpitz)       [ "$SHOW_ACPITZ" = 1 ] || continue; group=board; warn=$BOARD_WARN; crit=$BOARD_CRIT ;;
+      *)            group=board; warn=$BOARD_WARN; crit=$BOARD_CRIT ;;
+    esac
+    # friendly name for NVMe: resolve controller -> block device + model
+    blk=""
+    if [ "$group" = nvme ]; then
+      ctrl=$(readlink -f "$h/device" 2>/dev/null)
+      for n in /sys/block/nvme*n1; do
+        [ -e "$n" ] || continue
+        [ "$(readlink -f "$n/device" 2>/dev/null)" = "$ctrl" ] || continue
+        blk=$(basename "$n"); model=$(cat "$n/device/model" 2>/dev/null | xargs); break
+      done
+    fi
+    local short=${name%%_*}; short=${short%%:*}
+    for f in "$h"/temp*_input; do
+      [ -r "$f" ] || continue
+      n=$(basename "$f"); n=${n%_input}
+      val=$(<"$f"); val=$(awk -v v="$val" 'BEGIN{printf "%.1f", v/1000}')
+      [ "$val" = "0.0" ] && continue
+      label=$(cat "$h/${n}_label" 2>/dev/null || echo "$n")
+      local wv=$warn cv=$crit
+      # NVMe reports meaningful per-drive limits; elsewhere *_max is a spec
+      # ceiling (e.g. NIC 120C), not a useful warning point — ignore it.
+      if [ "$group" = nvme ]; then
+        [ -r "$h/${n}_max" ]  && wv=$(awk -v v="$(<"$h/${n}_max")"  'BEGIN{printf "%d", v/1000}')
+        [ -r "$h/${n}_crit" ] && cv=$(awk -v v="$(<"$h/${n}_crit")" 'BEGIN{printf "%d", v/1000}')
+      fi
+      awk -v w="$wv" -v c="$cv" 'BEGIN{exit !(w>=c)}' && wv=$(awk -v c="$cv" 'BEGIN{printf "%d", c*0.85}')
+      case "$label" in temp[0-9]*) label="$short $label" ;; esac
+      if [ -n "$blk" ]; then
+        echo "$blk|nvme|${blk}  ${model:0:22}|$val|$wv|$cv"
+      else
+        echo "${name}.${n}|$group|$label|$val|$wv|$cv"
+      fi
+    done
+  done
+}
+
+read_disks() {
+  # SATA/SAS temps need both; without them the DISKS group is simply absent.
+  command -v smartctl >/dev/null 2>&1 || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local now d dev t model out
+  now=$(date +%s)
+  if [ -n "$DISK_CACHE" ] && [ $((now - DISK_CACHE_AT)) -lt "$DISK_EVERY" ]; then
+    printf '%s\n' "$DISK_CACHE"; return
+  fi
+  out=""
+  for d in /sys/block/sd*; do
+    [ -e "$d" ] || continue
+    dev=$(basename "$d")
+    model=$(cat "$d/device/model" 2>/dev/null | xargs)
+    t=$(smartctl -n standby -A -j "/dev/$dev" 2>/dev/null | jq -r '.temperature.current // empty')
+    if [ -z "$t" ]; then
+      out+="$dev|hdd|${dev}  ${model:0:22}|-|$HDD_WARN|$HDD_CRIT"$'\n'   # standby or no SMART
+    else
+      out+="$dev|hdd|${dev}  ${model:0:22}|$t|$HDD_WARN|$HDD_CRIT"$'\n'
+    fi
+  done
+  DISK_CACHE="${out%$'\n'}"; DISK_CACHE_AT=$now
+  printf '%s\n' "$DISK_CACHE"
+}
+
+# Fan headers are board-specific: which one is the CPU fan differs per model.
+# Name them in fans.conf as "<hwmon>.<fan> = label" (or just "<fan> = label"),
+# e.g.  it8688.fan5 = CPU   — unnamed headers fall back to the raw sysfs name.
+declare -A FANLABEL
+load_fan_labels() {
+  local line k v
+  [ -r "$FANCONF" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}
+    case "$line" in *=*) ;; *) continue ;; esac
+    k=${line%%=*}; v=${line#*=}
+    k=$(printf '%s' "$k" | tr -d '[:space:]')
+    v=$(printf '%s' "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$k" ] && FANLABEL["$k"]="$v"
+  done < "$FANCONF"
+}
+
+fan_label() {
+  local key=$1 short=${1##*.}
+  if   [ -n "${FANLABEL[$key]:-}" ];   then echo "$short  ${FANLABEL[$key]}"
+  elif [ -n "${FANLABEL[$short]:-}" ]; then echo "$short  ${FANLABEL[$short]}"
+  else echo "$short"; fi
+}
+load_fan_labels
+
+read_fans() {
+  local h f n rpm name
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -r "$h/name" ] || continue; name=$(<"$h/name")
+    for f in "$h"/fan*_input; do
+      [ -r "$f" ] || continue
+      n=$(basename "$f"); n=${n%_input}; rpm=$(<"$f")
+      # empty headers read 0 forever; only surface a header once it has been
+      # seen spinning, so a 0 here means a fan actually stopped.
+      if [ "$rpm" -gt 0 ]; then
+        grep -qxF "${name}.${n}" "$FANSEEN" 2>/dev/null || echo "${name}.${n}" >> "$FANSEEN"
+      else
+        grep -qxF "${name}.${n}" "$FANSEEN" 2>/dev/null || continue
+      fi
+      echo "${name}.${n}|$rpm"
+    done
+  done
+}
+
+collect() { read_hwmon; read_disks; }
+
+state_of() { # temp warn crit -> OK|WARN|CRIT|NA
+  [ "$1" = "-" ] && { echo NA; return; }
+  awk -v t="$1" -v w="$2" -v c="$3" 'BEGIN{print (t>=c)?"CRIT":((t>=w)?"WARN":"OK")}'
+}
+
+# ---- rendering --------------------------------------------------------------
+if [ -t 1 ]; then R=$'\e[31m'; Y=$'\e[33m'; G=$'\e[32m'; D=$'\e[2m'; B=$'\e[1m'; N=$'\e[0m'
+else R=""; Y=""; G=""; D=""; B=""; N=""; fi
+
+render() {
+  local data="$1" worst=OK hottest=0 hotname=""
+  # --- geometrie: hoeveel kolommen passen er? ------------------------------
+  local width=${TEMPWATCH_COLS:-$(tput cols 2>/dev/null || echo 100)}
+  [ "$width" -ge 40 ] 2>/dev/null || width=80
+  # zoveel kolommen als passen zonder onder MINW te zakken
+  local GAP=2 MINW=38 ncols=1 try
+  for try in 3 2 1; do
+    if [ $(( (width - (try-1)*GAP) / try )) -ge "$MINW" ]; then ncols=$try; break; fi
+  done
+  local CW=$(( (width - (ncols-1)*GAP) / ncols ))
+  [ "$CW" -gt 46 ] && CW=46
+  local LW=$(( CW - 16 )); [ "$LW" -lt 12 ] && LW=12
+  CW=$(( LW + 16 ))
+  local blank; printf -v blank '%*s' "$CW" ''
+
+  printf '%s%s%s  %s\n%s%s, load%s%s\n\n' "$B" "$(hostname)" "$N" "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "$D" "$(uptime -p 2>/dev/null)" "$(cut -d' ' -f1-3 /proc/loadavg | sed 's/^/ /')" "$N"
+
+  # --- bouw per groep een blok --------------------------------------------
+  local -a bbody bh
+  local group title body n key g label t w c st col rpm line
+  for group in hdd board cpu nvme nic fan; do
+    body=""; n=0
+    case $group in
+      hdd) title=DISKS ;; board) title=BOARD ;; cpu) title=CPU ;;
+      nvme) title=NVMe ;; nic) title=NETWORK ;; fan) title=FANS ;;
+    esac
+    if [ "$group" = fan ]; then
+      while IFS='|' read -r key rpm; do
+        [ -z "$key" ] && continue
+        col="$G"; [ "$rpm" -eq 0 ] 2>/dev/null && { col="$R"; worst=CRIT; }
+        printf -v line '  %-*.*s %s%6s%s rpm   ' "$LW" "$LW" "$(fan_label "$key")" "$col" "$rpm" "$N"
+        body+="$line"$'\n'; n=$((n+1))
+      done <<< "$(read_fans)"
+      if [ "$n" = 0 ]; then
+        printf -v line '%s%-*.*s%s' "$D" "$CW" "$CW" "  (it87 niet geladen)" "$N"
+        body+="$line"$'\n'; n=1
+      fi
+    else
+      while IFS='|' read -r key g label t w c; do
+        [ "$g" = "$group" ] || continue
+        st=$(state_of "$t" "$w" "$c")
+        case "$st" in
+          CRIT) col="$R"; worst=CRIT ;;
+          WARN) col="$Y"; [ "$worst" = OK ] && worst=WARN ;;
+          NA)   col="$D" ;;
+          *)    col="$G" ;;
+        esac
+        if [ "$t" != "-" ]; then
+          awk -v t="$t" -v h="$hottest" 'BEGIN{exit !(t>h)}' && { hottest=$t; hotname=$label; }
+          printf -v line '  %-*.*s %s%6.1f°C%s %s%-4s%s' "$LW" "$LW" "$label" "$col" "$t" "$N" "$col" "$st" "$N"
+        else
+          printf -v line '  %-*.*s %s%6s  %s %s%-4s%s' "$LW" "$LW" "$label" "$D" "--" "$N" "$D" "idle" "$N"
+        fi
+        body+="$line"$'\n'; n=$((n+1))
+      done <<< "$data"
+    fi
+    [ "$n" = 0 ] && continue
+    printf -v line '%s%-*.*s%s' "$D" "$CW" "$CW" "  $title" "$N"
+    bbody+=("$line"$'\n'"${body%$'\n'}"); bh+=("$((n+1))")
+  done
+
+  # --- verdeel blokken over kolommen (grootste eerst, kortste kolom wint) --
+  local -a C0 C1 C2 colh
+  local i j best
+  for ((i=0; i<ncols; i++)); do colh[i]=0; done
+  for ((i=0; i<${#bbody[@]}; i++)); do
+    best=0
+    for ((j=1; j<ncols; j++)); do [ "${colh[j]}" -lt "${colh[best]}" ] && best=$j; done
+    if [ "${colh[best]}" -gt 0 ]; then
+      case $best in 0) C0+=("$blank");; 1) C1+=("$blank");; 2) C2+=("$blank");; esac
+      colh[best]=$(( colh[best] + 1 ))
+    fi
+    while IFS= read -r line; do
+      case $best in 0) C0+=("$line");; 1) C1+=("$line");; 2) C2+=("$line");; esac
+    done <<< "${bbody[i]}"
+    colh[best]=$(( colh[best] + bh[i] ))
+  done
+
+  # --- naast elkaar uitprinten --------------------------------------------
+  local H=0; for ((j=0; j<ncols; j++)); do [ "${colh[j]}" -gt "$H" ] && H=${colh[j]}; done
+  local row out
+  for ((i=0; i<H; i++)); do
+    out=""
+    for ((j=0; j<ncols; j++)); do
+      case $j in 0) row=${C0[i]-} ;; 1) row=${C1[i]-} ;; 2) row=${C2[i]-} ;; esac
+      [ -z "$row" ] && row="$blank"
+      out+="$row"; [ $((j+1)) -lt "$ncols" ] && printf -v out '%s%*s' "$out" "$GAP" ''
+    done
+    printf '%s\n' "${out%"${out##*[! ]}"}"
+  done
+  echo
+  case "$worst" in
+    CRIT) printf '  %s%s CRITICAL%s — hottest %s°C (%s)\n' "$R" "$B" "$N" "$hottest" "$hotname" ;;
+    WARN) printf '  %s%s WARNING%s — hottest %s°C (%s)\n'  "$Y" "$B" "$N" "$hottest" "$hotname" ;;
+    *)    printf '  %s%s All clear%s — hottest %s°C (%s)\n' "$G" "$B" "$N" "$hottest" "$hotname" ;;
+  esac
+}
+
+# ---- alerting ---------------------------------------------------------------
+send() {
+  command -v curl >/dev/null 2>&1 || { echo "[curl missing] $1"; return; }
+  [ -z "$TOKEN" ] || [ -z "$CHAT" ] && { echo "[no telegram creds] $1"; return; }
+  curl -sS -m15 -o /dev/null "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT}" --data-urlencode "text=$1" --data "parse_mode=HTML" || true
+}
+
+do_check() {
+  local data now msg="" first=0 key g label t w c st prev pstate pwhen line
+  data=$(collect); now=$(date +%s)
+  declare -A PREV
+  if [ -f "$STATE" ]; then
+    while IFS='=' read -r k v; do [ -n "$k" ] && PREV["$k"]="$v"; done < "$STATE"
+  else first=1; fi
+  : > "$STATE.new"
+  local summary="" worst=OK
+  while IFS='|' read -r key g label t w c; do
+    [ -z "$key" ] && continue
+    st=$(state_of "$t" "$w" "$c")
+    if [ "$st" = NA ]; then                      # standby disk: carry old state, don't alert
+      echo "$key=${PREV[$key]:-OK:0}" >> "$STATE.new"; continue
+    fi
+    prev="${PREV[$key]:-}"; pstate="${prev%%:*}"; pwhen="${prev#*:}"; [ "$pwhen" = "$prev" ] && pwhen=0
+    summary+="$key=$t "
+    case "$st" in CRIT) worst=CRIT ;; WARN) [ "$worst" = OK ] && worst=WARN ;; esac
+    local alert_at="$pwhen"
+    if [ "$st" != "$pstate" ]; then
+      alert_at=$now
+      case "$st" in
+        CRIT) msg+="🔥 CRITICAL: ${label} ${t}°C (crit ${c}°C)"$'\n' ;;
+        WARN) msg+="🟠 WARM: ${label} ${t}°C (warn ${w}°C)"$'\n' ;;
+        OK)   [ -n "$pstate" ] && [ "$pstate" != OK ] && msg+="✅ back to normal: ${label} ${t}°C"$'\n' ;;
+      esac
+    elif [ "$st" = CRIT ] && [ $((now - pwhen)) -ge "$CRIT_REPEAT" ]; then
+      alert_at=$now
+      msg+="🔥 STILL CRITICAL: ${label} ${t}°C ($(( (now-pwhen)/60 ))m)"$'\n'
+    fi
+    echo "$key=$st:$alert_at" >> "$STATE.new"
+  done <<< "$data"
+  # --- fans: a stopped fan is why temps climb, so catch it directly ---
+  local fkey frpm fst
+  while IFS='|' read -r fkey frpm; do
+    [ -z "$fkey" ] && continue
+    [ "$frpm" -gt 0 ] 2>/dev/null && fst=SPINNING || fst=STOPPED
+    prev="${PREV[fan:$fkey]:-}"; pstate="${prev%%:*}"; pwhen="${prev#*:}"
+    [ "$pwhen" = "$prev" ] && pwhen=0
+    [ "$fst" = STOPPED ] && worst=CRIT
+    local falert="$pwhen"
+    if [ "$fst" != "$pstate" ]; then
+      falert=$now
+      case "$fst" in
+        STOPPED)  msg+="🛑 FAN STOPPED: $(fan_label "$fkey") — 0 rpm"$'\n' ;;
+        SPINNING) [ -n "$pstate" ] && msg+="✅ fan running again: $(fan_label "$fkey") ${frpm} rpm"$'\n' ;;
+      esac
+    elif [ "$fst" = STOPPED ] && [ $((now - pwhen)) -ge "$CRIT_REPEAT" ]; then
+      falert=$now
+      msg+="🛑 FAN STILL STOPPED: $(fan_label "$fkey") ($(( (now-pwhen)/60 ))m)"$'\n'
+    fi
+    echo "fan:$fkey=$fst:$falert" >> "$STATE.new"
+  done <<< "$(read_fans)"
+
+  mv "$STATE.new" "$STATE"
+
+  echo "$(date '+%F %T') worst=$worst $summary" >> "$LOG"
+  [ -f "$LOG" ] && tail -n "$LOG_KEEP" "$LOG" > "$LOG.t" && mv "$LOG.t" "$LOG"
+
+  if [ "$first" = 1 ]; then
+    send "🌡️ <b>Temp monitor armed on $(hostname)</b>"$'\n'"Watching $(grep -c . "$STATE") sensors. Current: ${worst}."${msg:+$'\n'"$msg"}
+  elif [ -n "$msg" ]; then
+    send "🌡️ <b>$(hostname) temperature</b>"$'\n'"$msg"
+  fi
+  case "$worst" in CRIT) return 2 ;; WARN) return 1 ;; *) return 0 ;; esac
+}
+
+# ---- main -------------------------------------------------------------------
+case "$MODE" in
+  show)  render "$(collect)" ;;
+  watch) trap 'printf "\e[?25h\n"; exit 0' INT TERM
+         printf '\e[?25l'
+         while :; do
+           out=$(render "$(collect)")
+           printf '\e[H\e[2J%s\n  %s(refresh %ss — ctrl-c to quit)%s\n' "$out" "$D" "$INTERVAL" "$N"
+           sleep "$INTERVAL"
+         done ;;
+  check) do_check ;;
+  json)  collect | awk -F'|' -v q='"' 'BEGIN{print "["} {if(NR>1)print ",";
+           st=($4=="-")?"na":(($4>=$6)?"crit":(($4>=$5)?"warn":"ok"));
+           printf "  {\"key\":%s%s%s,\"group\":%s%s%s,\"temp\":%s,\"warn\":%s,\"crit\":%s,\"state\":%s%s%s}",
+             q,$1,q,q,$2,q,($4=="-")?"null":$4,$5,$6,q,st,q} END{print "\n]"}' ;;
+  test)  send "🌡️ tempwatch test from $(hostname) — $(date '+%F %T')"; echo "sent (if creds present)" ;;
+esac

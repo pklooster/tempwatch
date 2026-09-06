@@ -1,0 +1,6 @@
+*.bak
+*.bak-*
+state.txt
+temp.log
+fans-seen.txt
+telegram.env
